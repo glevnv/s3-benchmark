@@ -25,6 +25,12 @@ type latency struct {
 	LastByte  time.Duration
 }
 
+// represents the duration for upload operations
+type uploadLatency struct {
+	StartTime time.Duration  // Time to start the upload
+	EndTime   time.Duration  // Time to complete the upload
+}
+
 // summary statistics used to summarize first byte and last byte latencies
 type stat int
 
@@ -46,6 +52,16 @@ type benchmark struct {
 	firstByte  map[stat]float64
 	lastByte   map[stat]float64
 	dataPoints []latency
+}
+
+// upload benchmark record for one object size and thread count
+type uploadBenchmark struct {
+	objectSize     uint64
+	threads        int
+	rate           float64  // throughput rate in MB/s
+	startTime      map[stat]float64
+	endTime        map[stat]float64
+	uploadDataPoints []uploadLatency
 }
 
 // absolute limits
@@ -97,6 +113,9 @@ var createBucket bool
 
 // the S3 SDK client
 var s3Client *s3.S3
+
+// store upload benchmarks for later display
+var uploadBenchmarks []uploadBenchmark
 
 // program entry point
 func main() {
@@ -258,10 +277,10 @@ func setup() {
 
 		fmt.Printf("Uploading \033[1;33m%-s\033[0m objects\n", byteFormat(float64(objectSize)))
 
-		// create a progress bar
+		// create a progress bar for object creation
 		bar := progressbar.NewOptions(threadsMax-1, progressbar.OptionSetRenderBlankState(true))
 
-		// create an object for every thread, so that different threads don't download the same object
+		// first, create objects for all thread counts (needed for download benchmarks)
 		for t := 1; t <= threadsMax; t++ {
 			// increment the progress bar for each object
 			_ = bar.Add(1)
@@ -306,7 +325,149 @@ func setup() {
 		}
 
 		fmt.Print("\n")
+
+		// print the header for the upload benchmark of this object size
+		printUploadHeader(objectSize)
+
+		// run upload tests per thread count and object size combination
+		for t := threadsMin; t <= threadsMax; t++ {
+			execUploadTest(t, objectSize)
+		}
+		fmt.Print("+---------+----------------+------------------------------------------------+------------------------------------------------+\n\n")
 	}
+}
+
+func execUploadTest(threadCount int, payloadSize uint64) {
+	// this overrides the sample count on small hosts that can get overwhelmed by a large throughput
+	samples := getTargetSampleCount(threadCount, samples)
+
+	// a channel to submit the upload test tasks
+	uploadTasks := make(chan int, threadCount)
+
+	// a channel to receive results from the upload test tasks back on the main thread
+	results := make(chan uploadLatency, samples)
+
+	// create the workers for all the threads in this test
+	for w := 1; w <= threadCount; w++ {
+		go func(o int, tasks <-chan int, results chan<- uploadLatency) {
+			for taskNum := range tasks {
+				// generate a unique S3 key for upload benchmarking (different from download test objects)
+				key := fmt.Sprintf("upload-benchmark-%s-%03d-%012d-%03d", hostname, o, payloadSize, taskNum)
+
+				// generate empty payload
+				payload := make([]byte, payloadSize)
+
+				// start the timer to measure the upload latencies
+				uploadTimer := time.Now()
+
+				// do a PutObject request to create the object
+				putReq := s3Client.PutObjectRequest(&s3.PutObjectInput{
+					Bucket: aws.String(bucketName),
+					Key:    aws.String(key),
+					Body:   bytes.NewReader(payload),
+				})
+
+				// measure the start time (time to initiate request)
+				startTime := time.Now().Sub(uploadTimer)
+
+				_, err := putReq.Send()
+
+				// if the put fails, exit
+				if err != nil {
+					panic("Failed to put S3 object: " + err.Error())
+				}
+
+				// measure the end time (time to complete upload)
+				endTime := time.Now().Sub(uploadTimer)
+
+				// add the upload latency result to the results channel
+				results <- uploadLatency{StartTime: startTime, EndTime: endTime}
+
+				// clean up the benchmark object immediately after measurement
+				deleteReq := s3Client.DeleteObjectRequest(&s3.DeleteObjectInput{
+					Bucket: aws.String(bucketName),
+					Key:    aws.String(key),
+				})
+				_, _ = deleteReq.Send() // ignore errors for cleanup
+			}
+		}(w, uploadTasks, results)
+	}
+
+	// start the timer for this benchmark
+	benchmarkTimer := time.Now()
+
+	// submit all the upload test tasks
+	for j := 1; j <= samples; j++ {
+		uploadTasks <- j
+	}
+
+	// close the channel
+	close(uploadTasks)
+
+	// construct a new upload benchmark record
+	uploadBenchmarkRecord := uploadBenchmark{
+		startTime: make(map[stat]float64),
+		endTime:   make(map[stat]float64),
+	}
+	sumStartTime := int64(0)
+	sumEndTime := int64(0)
+	uploadBenchmarkRecord.threads = threadCount
+	uploadBenchmarkRecord.objectSize = payloadSize
+
+	// wait for all the results to come and collect the individual datapoints
+	for s := 1; s <= samples; s++ {
+		timing := <-results
+		uploadBenchmarkRecord.uploadDataPoints = append(uploadBenchmarkRecord.uploadDataPoints, timing)
+		sumStartTime += timing.StartTime.Nanoseconds()
+		sumEndTime += timing.EndTime.Nanoseconds()
+	}
+
+	// stop the timer for this benchmark
+	totalTime := time.Now().Sub(benchmarkTimer)
+
+	// calculate the summary statistics for the start time latencies
+	sort.Sort(ByUploadStartTime(uploadBenchmarkRecord.uploadDataPoints))
+	uploadBenchmarkRecord.startTime[avg] = (float64(sumStartTime) / float64(samples)) / 1000000
+	uploadBenchmarkRecord.startTime[min] = float64(uploadBenchmarkRecord.uploadDataPoints[0].StartTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.startTime[max] = float64(uploadBenchmarkRecord.uploadDataPoints[len(uploadBenchmarkRecord.uploadDataPoints)-1].StartTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.startTime[p25] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.25))-1].StartTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.startTime[p50] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.5))-1].StartTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.startTime[p75] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.75))-1].StartTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.startTime[p90] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.90))-1].StartTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.startTime[p99] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.99))-1].StartTime.Nanoseconds()) / 1000000
+
+	// calculate the summary statistics for the end time latencies
+	sort.Sort(ByUploadEndTime(uploadBenchmarkRecord.uploadDataPoints))
+	uploadBenchmarkRecord.endTime[avg] = (float64(sumEndTime) / float64(samples)) / 1000000
+	uploadBenchmarkRecord.endTime[min] = float64(uploadBenchmarkRecord.uploadDataPoints[0].EndTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.endTime[max] = float64(uploadBenchmarkRecord.uploadDataPoints[len(uploadBenchmarkRecord.uploadDataPoints)-1].EndTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.endTime[p25] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.25))-1].EndTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.endTime[p50] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.5))-1].EndTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.endTime[p75] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.75))-1].EndTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.endTime[p90] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.90))-1].EndTime.Nanoseconds()) / 1000000
+	uploadBenchmarkRecord.endTime[p99] = float64(uploadBenchmarkRecord.uploadDataPoints[int(float64(samples)*float64(0.99))-1].EndTime.Nanoseconds()) / 1000000
+
+	// calculate the throughput rate (total bytes uploaded / total time)
+	totalBytes := float64(payloadSize * uint64(samples))
+	rate := totalBytes / totalTime.Seconds() / 1024 / 1024
+
+	// store the rate in the benchmark record
+	uploadBenchmarkRecord.rate = rate
+
+	// determine what to put in the first column of the results
+	c := uploadBenchmarkRecord.threads
+	if throttlingMode {
+		c = 1 // or some run number if needed
+	}
+
+	// print the results to stdout
+	fmt.Printf("| %7d | \033[1;31m%9.1f MB/s\033[0m |%5.0f %5.0f %5.0f %5.0f %5.0f %5.0f %5.0f %5.0f |%5.0f %5.0f %5.0f %5.0f %5.0f %5.0f %5.0f %5.0f |\n",
+		c, rate,
+		uploadBenchmarkRecord.startTime[avg], uploadBenchmarkRecord.startTime[min], uploadBenchmarkRecord.startTime[p25], uploadBenchmarkRecord.startTime[p50], uploadBenchmarkRecord.startTime[p75], uploadBenchmarkRecord.startTime[p90], uploadBenchmarkRecord.startTime[p99], uploadBenchmarkRecord.startTime[max],
+		uploadBenchmarkRecord.endTime[avg], uploadBenchmarkRecord.endTime[min], uploadBenchmarkRecord.endTime[p25], uploadBenchmarkRecord.endTime[p50], uploadBenchmarkRecord.endTime[p75], uploadBenchmarkRecord.endTime[p90], uploadBenchmarkRecord.endTime[p99], uploadBenchmarkRecord.endTime[max])
+
+	// store the upload benchmark for later use in CSV
+	uploadBenchmarks = append(uploadBenchmarks, uploadBenchmarkRecord)
 }
 
 func runBenchmark() {
@@ -314,6 +475,16 @@ func runBenchmark() {
 
 	// array of csv records used to upload the results to S3 when the test is finished
 	var csvRecords [][]string
+
+	// add CSV header row
+	csvRecords = append(csvRecords, []string{
+		"hostname", "instance_type", "payload_size", "threads", "download_rate_mbps",
+		"download_first_byte_avg", "download_first_byte_min", "download_first_byte_p25", "download_first_byte_p50", "download_first_byte_p75", "download_first_byte_p90", "download_first_byte_p99", "download_first_byte_max",
+		"download_last_byte_avg", "download_last_byte_min", "download_last_byte_p25", "download_last_byte_p50", "download_last_byte_p75", "download_last_byte_p90", "download_last_byte_p99", "download_last_byte_max",
+		"upload_rate_mbps",
+		"upload_start_time_avg", "upload_start_time_min", "upload_start_time_p25", "upload_start_time_p50", "upload_start_time_p75", "upload_start_time_p90", "upload_start_time_p99", "upload_start_time_max",
+		"upload_end_time_avg", "upload_end_time_min", "upload_end_time_p25", "upload_end_time_p50", "upload_end_time_p75", "upload_end_time_p90", "upload_end_time_p99", "upload_end_time_max",
+	})
 
 	// an object size iterator that starts from 1 KB and doubles the size on every iteration
 	generatePayload := payloadSizeGenerator()
@@ -507,13 +678,22 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 		benchmarkRecord.firstByte[avg], benchmarkRecord.firstByte[min], benchmarkRecord.firstByte[p25], benchmarkRecord.firstByte[p50], benchmarkRecord.firstByte[p75], benchmarkRecord.firstByte[p90], benchmarkRecord.firstByte[p99], benchmarkRecord.firstByte[max],
 		benchmarkRecord.lastByte[avg], benchmarkRecord.lastByte[min], benchmarkRecord.lastByte[p25], benchmarkRecord.lastByte[p50], benchmarkRecord.lastByte[p75], benchmarkRecord.lastByte[p90], benchmarkRecord.lastByte[p99], benchmarkRecord.lastByte[max])
 
+	// find matching upload benchmark for this payload size and thread count
+	var uploadBenchmarkRecord *uploadBenchmark
+	for i := range uploadBenchmarks {
+		if uploadBenchmarks[i].objectSize == payloadSize && uploadBenchmarks[i].threads == benchmarkRecord.threads {
+			uploadBenchmarkRecord = &uploadBenchmarks[i]
+			break
+		}
+	}
+
 	// add the results to the csv array
-	csvRecords = append(csvRecords, []string{
+	csvRecord := []string{
 		fmt.Sprintf("%s", hostname),
 		fmt.Sprintf("%s", instanceType),
 		fmt.Sprintf("%d", payloadSize),
 		fmt.Sprintf("%d", benchmarkRecord.threads),
-		fmt.Sprintf("%.3f", rate),
+		fmt.Sprintf("%.3f", rate), // download rate
 		fmt.Sprintf("%.1f", benchmarkRecord.firstByte[avg]),
 		fmt.Sprintf("%.1f", benchmarkRecord.firstByte[min]),
 		fmt.Sprintf("%.1f", benchmarkRecord.firstByte[p25]),
@@ -530,7 +710,38 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 		fmt.Sprintf("%.1f", benchmarkRecord.lastByte[p90]),
 		fmt.Sprintf("%.1f", benchmarkRecord.lastByte[p99]),
 		fmt.Sprintf("%.1f", benchmarkRecord.lastByte[max]),
-	})
+	}
+
+	// add upload statistics if available
+	if uploadBenchmarkRecord != nil {
+		csvRecord = append(csvRecord, []string{
+			fmt.Sprintf("%.3f", uploadBenchmarkRecord.rate), // upload rate
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[avg]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[min]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[p25]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[p50]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[p75]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[p90]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[p99]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.startTime[max]),
+			fmt.Sprintf("%.2f", uploadBenchmarkRecord.endTime[avg]),
+			fmt.Sprintf("%.2f", uploadBenchmarkRecord.endTime[min]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.endTime[p25]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.endTime[p50]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.endTime[p75]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.endTime[p90]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.endTime[p99]),
+			fmt.Sprintf("%.1f", uploadBenchmarkRecord.endTime[max]),
+		}...)
+	} else {
+		// add empty upload statistics if no upload data available
+		csvRecord = append(csvRecord, []string{
+			"0", "0", "0", "0", "0", "0", "0", "0", "0", // upload rate and start time stats
+			"0", "0", "0", "0", "0", "0", "0", "0", "0", // upload end time stats
+		}...)
+	}
+
+	csvRecords = append(csvRecords, csvRecord)
 
 	return csvRecords
 }
@@ -548,6 +759,28 @@ func printHeader(objectSize uint64) {
 	fmt.Printf("Download performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
 	fmt.Println("                           +-------------------------------------------------------------------------------------------------+")
 	fmt.Println("                           |            Time to First Byte (ms)             |            Time to Last Byte (ms)              |")
+	fmt.Println("+---------+----------------+------------------------------------------------+------------------------------------------------+")
+	if !throttlingMode {
+		fmt.Println("| Threads |     Throughput |  avg   min   p25   p50   p75   p90   p99   max |  avg   min   p25   p50   p75   p90   p99   max |")
+	} else {
+		fmt.Println("|       # |     Throughput |  avg   min   p25   p50   p75   p90   p99   max |  avg   min   p25   p50   p75   p90   p99   max |")
+	}
+	fmt.Println("+---------+----------------+------------------------------------------------+------------------------------------------------+")
+}
+
+// prints the table header for the upload test results
+func printUploadHeader(objectSize uint64) {
+	// instance type string used to render results to stdout
+	instanceTypeString := ""
+
+	if instanceType != "" {
+		instanceTypeString = " (" + instanceType + ")"
+	}
+
+	// print the table header
+	fmt.Printf("Upload performance with \033[1;33m%-s\033[0m objects%s\n", byteFormat(float64(objectSize)), instanceTypeString)
+	fmt.Println("                           +-------------------------------------------------------------------------------------------------+")
+	fmt.Println("                           |            Time to Start (ms)                  |            Time to Complete (ms)               |")
 	fmt.Println("+---------+----------------+------------------------------------------------+------------------------------------------------+")
 	if !throttlingMode {
 		fmt.Println("| Threads |     Throughput |  avg   min   p25   p50   p75   p90   p99   max |  avg   min   p25   p50   p75   p90   p99   max |")
@@ -736,3 +969,17 @@ type ByLastByte []latency
 func (a ByLastByte) Len() int           { return len(a) }
 func (a ByLastByte) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByLastByte) Less(i, j int) bool { return a[i].LastByte < a[j].LastByte }
+
+// comparator to sort by upload start time
+type ByUploadStartTime []uploadLatency
+
+func (a ByUploadStartTime) Len() int           { return len(a) }
+func (a ByUploadStartTime) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByUploadStartTime) Less(i, j int) bool { return a[i].StartTime < a[j].StartTime }
+
+// comparator to sort by upload end time
+type ByUploadEndTime []uploadLatency
+
+func (a ByUploadEndTime) Len() int           { return len(a) }
+func (a ByUploadEndTime) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByUploadEndTime) Less(i, j int) bool { return a[i].EndTime < a[j].EndTime }
