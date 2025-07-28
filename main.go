@@ -229,7 +229,7 @@ func setupS3Client() {
 }
 
 func setup() {
-	fmt.Print("\n--- \033[1;32mUPLOAD\033[0m --------------------------------------------------------------------------------------------------------------------\n\n")
+	fmt.Print("\n--- \033[1;32mWRITE\033[0m --------------------------------------------------------------------------------------------------------------------\n\n")
 	if createBucket {
 		// try to create the S3 bucket
 		createBucketReq := s3Client.CreateBucketRequest(&s3.CreateBucketInput{
@@ -316,7 +316,7 @@ func setup() {
 		for t := threadsMin; t <= threadsMax; t++ {
 			execUploadTest(t, objectSize)
 		}
-		fmt.Print("+---------+--------------+----------------+-------------------------+----------------------------------------------+\n")
+		fmt.Print("+---------+--------------+-----------------------+------------------------------------------------+\n")
 	}
 }
 
@@ -416,11 +416,11 @@ func execUploadTest(threadCount int, payloadSize uint64) {
 	sort.Sort(ByUploadEndTime(uploadBenchmarkRecord.uploadDataPoints))
 	uploadBenchmarkRecord.endTime[avg] = (float64(sumEndTime) / float64(samples)) / 1000000
 
-	// calculate the throughput rate (total bytes uploaded / total time)
+	// calculate the throughput rate (for bandwidth calculations only)
 	totalBytes := float64(payloadSize * uint64(samples))
 	rate := totalBytes / totalTime.Seconds() / 1024 / 1024
 
-	// store the rate in the benchmark record
+	// store the rate in the benchmark record for CSV output
 	uploadBenchmarkRecord.rate = rate
 
 	// determine what to put in the first column of the results
@@ -439,15 +439,15 @@ func execUploadTest(threadCount int, payloadSize uint64) {
 	avgLatencyUs := uploadBenchmarkRecord.endTime[avg] * 1000
 
 	// print the results to stdout
-	fmt.Printf("| %7d | %12s | \033[1;31m%9.1f MB/s\033[0m | %21.0f | %14.9f  %14.9f  %14.9f |\n",
-		c, formatPayloadSize(payloadSize), rate, avgLatencyUs, bandwidthMiB, bandwidthGiB, bandwidthGB)
+	fmt.Printf("| %7d | %12s | %21.0f | %14.9f  %14.9f  %14.9f |\n",
+		c, formatPayloadSize(payloadSize), avgLatencyUs, bandwidthMiB, bandwidthGiB, bandwidthGB)
 
 	// store the upload benchmark for later use in CSV
 	uploadBenchmarks = append(uploadBenchmarks, uploadBenchmarkRecord)
 }
 
 func runBenchmark() {
-	fmt.Print("\n--- \033[1;32mDOWNLOAD\033[0m ----------------------------------------------------------------------------------------------------------------\n\n")
+	fmt.Print("\n--- \033[1;32mREAD\033[0m ----------------------------------------------------------------------------------------------------------------\n\n")
 
 	// array of csv records used to upload the results to S3 when the test is finished
 	var csvRecords [][]string
@@ -455,8 +455,8 @@ func runBenchmark() {
 	// add CSV header row
 	csvRecords = append(csvRecords, []string{
 		"hostname", "instance_type", "payload_size", "threads",
-		"download_rate_mbps", "download_avg_latency_us", "download_bandwidth_mib_sec", "download_bandwidth_gib_sec", "download_bandwidth_gb_sec",
-		"upload_rate_mbps", "upload_avg_latency_us", "upload_bandwidth_mib_sec", "upload_bandwidth_gib_sec", "upload_bandwidth_gb_sec",
+		"download_avg_latency_us", "download_bandwidth_mib_sec", "download_bandwidth_gib_sec", "download_bandwidth_gb_sec",
+		"upload_avg_latency_us", "upload_bandwidth_mib_sec", "upload_bandwidth_gib_sec", "upload_bandwidth_gb_sec",
 	})
 
 	// an object size iterator that starts from 1 KB and doubles the size on every iteration
@@ -485,7 +485,7 @@ func runBenchmark() {
 				}
 			}
 		}
-		fmt.Print("+---------+--------------+----------------+-------------------------+----------------------------------------------+\n")
+		fmt.Print("+---------+--------------+-----------------------+------------------------------------------------+\n")
 	}
 
 	// if the csv option is true, upload the csv results to S3
@@ -619,7 +619,7 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 	sort.Sort(ByLastByte(benchmarkRecord.dataPoints))
 	benchmarkRecord.lastByte[avg] = (float64(sumLastByte) / float64(samples)) / 1000000
 
-	// calculate the throughput rate
+	// calculate the throughput rate (for bandwidth calculations only)
 	rate := (float64(benchmarkRecord.objectSize)) / (totalTime.Seconds()) / 1024 / 1024
 
 	// determine what to put in the first column of the results
@@ -638,8 +638,8 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 	avgLatencyUs := benchmarkRecord.lastByte[avg] * 1000
 
 	// print the results to stdout
-	fmt.Printf("| %7d | %12s | \033[1;31m%9.1f MB/s\033[0m | %21.0f | %14.9f  %14.9f  %14.9f |\n",
-		c, formatPayloadSize(payloadSize), rate, avgLatencyUs, bandwidthMiB, bandwidthGiB, bandwidthGB)
+	fmt.Printf("| %7d | %12s | %21.0f | %14.9f  %14.9f  %14.9f |\n",
+		c, formatPayloadSize(payloadSize), avgLatencyUs, bandwidthMiB, bandwidthGiB, bandwidthGB)
 
 	// find matching upload benchmark for this payload size and thread count
 	var uploadBenchmarkRecord *uploadBenchmark
@@ -656,7 +656,6 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 		fmt.Sprintf("%s", instanceType),
 		fmt.Sprintf("%d", payloadSize),
 		fmt.Sprintf("%d", benchmarkRecord.threads),
-		fmt.Sprintf("%.3f", rate), // download rate
 		fmt.Sprintf("%.0f", avgLatencyUs), // download average latency in microseconds
 		fmt.Sprintf("%.2f", bandwidthMiB), // download bandwidth in MiB/sec
 		fmt.Sprintf("%.3f", bandwidthGiB), // download bandwidth in GiB/sec
@@ -672,7 +671,6 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 		uploadAvgLatencyUs := uploadBenchmarkRecord.endTime[avg] * 1000
 
 		csvRecord = append(csvRecord, []string{
-			fmt.Sprintf("%.3f", uploadBenchmarkRecord.rate), // upload rate
 			fmt.Sprintf("%.0f", uploadAvgLatencyUs), // upload average latency in microseconds
 			fmt.Sprintf("%.2f", uploadBandwidthMiB), // upload bandwidth in MiB/sec
 			fmt.Sprintf("%.3f", uploadBandwidthGiB), // upload bandwidth in GiB/sec
@@ -681,7 +679,7 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 	} else {
 		// add empty upload statistics if no upload data available
 		csvRecord = append(csvRecord, []string{
-			"0", "0", "0", "0", "0", // upload rate and stats
+			"0", "0", "0", "0", // upload latency and bandwidth stats
 		}...)
 	}
 
@@ -693,16 +691,16 @@ func execTest(threadCount int, payloadSize uint64, runNumber int, csvRecords [][
 // prints the table header for the test results
 func printHeader() {
 	// print the table header
-	fmt.Println("+------------------------+----------------+-----------------------+------------------------------------------------+")
-	fmt.Println("|                        |                |        Avg Lat.       |                   Bandwidth                    |")
-	fmt.Println("|                        |                |          (us)         |                                                |")
-	fmt.Println("+---------+--------------+----------------+-----------------------+------------------------------------------------+")
+	fmt.Println("+---------+--------------+-----------------------+------------------------------------------------+")
+	fmt.Println("|         |              |        Avg Lat.       |                   Bandwidth                    |")
+	fmt.Println("|         |              |          (us)         |                                                |")
+	fmt.Println("+---------+--------------+-----------------------+------------------------------------------------+")
 	if !throttlingMode {
-		fmt.Println("| Threads | Payload Size |   Throughput   |        Latency        |  B/W (MiB/Sec)    B/W (GiB/Sec)    B/W (GB/Sec)|")
+		fmt.Println("| Threads | Payload Size |        Latency        |  B/W (MiB/Sec)    B/W (GiB/Sec)    B/W (GB/Sec)|")
 	} else {
-		fmt.Println("|       # | Payload Size |   Throughput   |        Latency        |  B/W (MiB/Sec)    B/W (GiB/Sec)    B/W (GB/Sec)|")
+		fmt.Println("|       # | Payload Size |        Latency        |  B/W (MiB/Sec)    B/W (GiB/Sec)    B/W (GB/Sec)|")
 	}
-	fmt.Println("+---------+--------------+----------------+-------------------------+----------------------------------------------+")
+	fmt.Println("+---------+--------------+-----------------------+------------------------------------------------+")
 }
 
 // generates an S3 key from the sha hash of the hostname, thread index, and object size
