@@ -15,19 +15,19 @@ With this tool you can measure S3's performance from any location, using differe
 
 #### macOS
 ```
-curl -OL https://github.com/dvassallo/s3-benchmark/raw/master/build/darwin-amd64/s3-benchmark
+curl -OL https://github.com/glevnv/s3-benchmark/raw/master/build/darwin-amd64/s3-benchmark
 ```
 
 #### Linux 64-bit x86
 
 ```
-curl -OL https://github.com/dvassallo/s3-benchmark/raw/master/build/linux-amd64/s3-benchmark
+curl -OL https://github.com/glevnv/s3-benchmark/raw/master/build/linux-amd64/s3-benchmark
 ```
 
 #### Linux 64-bit ARM
 
 ```
-curl -OL https://github.com/dvassallo/s3-benchmark/raw/master/build/linux-arm64/s3-benchmark
+curl -OL https://github.com/glevnv/s3-benchmark/raw/master/build/linux-arm64/s3-benchmark
 ```
 
 ### Credentials
@@ -52,7 +52,7 @@ Or run the full test (takes a few hours):
 ./s3-benchmark -full
 ```
 
-See [this](https://github.com/dvassallo/s3-benchmark/blob/master/main.go#L123-L134) for all the other options.
+See [this](https://github.com/glevnv/s3-benchmark/blob/master/main.go#L123-L134) for all the other options.
 
 ### Build
 
